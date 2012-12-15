@@ -1,13 +1,13 @@
 #include <stdlib.h>
-#include "../../drivers/avr_compiler.h"
-#include "../../drivers/usart_driver.h"
-#include "../../drivers/twi_master_driver.h"
+#include <avr_compiler.h>
+#include <usart_driver.h>
+#include <twi_master_driver.h>
 #include "support.h"
 #include <stdio.h>
 #include "itg3200.h" // gyro - i2c
 #include "adxl345.h" // acceleromter - i2c
 #include "math.h" 
-#include "../drl/adc.h" // for IR sensors
+#include <adc.h> // for IR sensors
 //#include "lsm303dlh.h" 
 /*Xbee Wireless Communication Module, initialized later*/
 USART_data_t xbee;
@@ -19,6 +19,12 @@ TWI_Master_t imu; // that means acceleromter
 /*States for flight control state machine*/
 enum states{running, stopped, offset} state = stopped;
 
+/****************************************************
+ * These variables are probably used in interrupts, given
+ * their "volatile" attribute.  They should probably go
+ * in their respective *.c files, along with the interrupts
+ * they are with.
+ *****************************************************/
 /*Flag for complete Xbee packet receival*/
 volatile char readdata = 0;
 volatile char readdatair = 0;
@@ -29,31 +35,122 @@ volatile char inputir[12] = {0,0,0,0,0,0,0,0,0,0,0,0};
 volatile char xbeecounter = 0;
 volatile char megacounter = 0;
 
+
+void init( void ) {
+	set_clock(); //Make the clock 32Mhz
+
+
+	/*Set on board LED pins to output
+	 * I don't think this is correct.
+	 * The only LEDs on PORTF are on pin 7.
+	 * Pins 0 and 1 are PWM8 and 9.
+	 */
+	PORTF.DIR = 0x03;
+
+	PORTA.DIR = 0;
+
+	/*Initialize PORTD to output on pins 0-3 from Timer counter pwm at
+	  50Hz*/
+	PORTD.DIR = 0x0F;
+	TCD0.CTRLA = TC_CLKSEL_DIV8_gc;
+	TCD0.CTRLB = TC_WGMODE_SS_gc | TC0_CCCEN_bm |  TC0_CCAEN_bm |TC0_CCBEN_bm | TC0_CCDEN_bm;
+	TCD0.PER = 8000;
+
+
+	/*Initialize PORTC to output on pins 4-5 from Timer counter pwm at
+	  50Hz for horizontal sensors*/
+	PORTC.DIR = 0x30;
+	TCC1.CTRLA = TC_CLKSEL_DIV64_gc;
+	TCC1.CTRLB = TC_WGMODE_SS_gc | TC0_CCAEN_bm |TC0_CCBEN_bm;
+	TCC1.PER = 10000;
+
+	/*Initialize PORTF to output on pin 0 from Timer counter pwm at
+	  50Hz for forward sensors including camera*/
+	PORTF.DIR = 0x03;
+	TCF0.CTRLA = TC_CLKSEL_DIV64_gc;
+	TCF0.CTRLB = TC_WGMODE_SS_gc | TC0_CCAEN_bm;
+	TCF0.PER = 10000;
+
+
+	/*Set pwm duty cycle to stop motors, stop them from beeping 
+	  annoyingly*/
+	TCD0.CCA = 4000;
+	TCD0.CCB = 4000;
+	TCD0.CCC = 4000;
+	TCD0.CCD = 4000;
+
+	/*Initialize Timer counter C0 for pacing,RATE Hz*/
+	TCC0.CTRLA = TC_CLKSEL_DIV8_gc;
+	TCC0.CTRLB = TC_WGMODE_SS_gc;
+	TCC0.PER = 4000000 / RATE;
+
+	/*Enable Watch Dog Timer to save us from catastrophe*/
+	CCPWrite( &WDT.CTRL, 0b00010111);
+
+	/*Enable global interrupts of all priority levels, should be made
+	  more relevant*/
+	PMIC.CTRL |= PMIC_LOLVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_HILVLEN_bm;
+	sei();
+
+	/*Initialize imu to use Two wire interface on portC*/
+	PORTE.PIN0CTRL |= 0b00011000;
+	PORTE.PIN1CTRL |= 0b00011000;
+	twiInitiate(&imu, &TWIE);
+	itg3200Init(&imu, RATE);
+	adxl345Init(&imu);
+	//lsm303dlhInit(&imu);
+
+
+
+	/*Set Xbee Uart transmit pin 3 to output*/
+	PORTE.DIR = 0x88;
+	/*Initialize USARTE0 as the module used by the Xbee*/
+	uartInitiate(&xbee, &USARTE0, 115200);
+	uartInitiate(&mega, &USARTE1, 9600);
+}
+
 int main(void){
 
-	//Make the clock 32Mhz
-	OSC.CTRL = 0b00000010;//Enable oscilator
-	while(!(OSC.STATUS & 0b00000010));//wait for it to be ready
-	CCPWrite(&CLK.CTRL, 0b00000001);//Enable oscilator
 
-	//integration[2] is yaw
+	/************************************************
+	 * Why are there all these variable declarations here?
+	 * Shouldn't these be in a struct or something?
+	 *************************************************/
+
+	/* For integrating from the gyro?
+	 * integration[2] is yaw
+	 */
 	int integration[3] = {0,0,0};
 
-	int mag_correct;
+	int mag_correct; // what?
 
-	char lostsignalcnt = 0;
+	char lostsignalcnt = 0; // a measure of signal integrity?
 
 	int pry[] = {0,0,0}; // pitch, roll, yaw
 
-	int paceCounter = 0;
-	int pace_counter_60 = 0;
+	/* Used for distributing task load.
+	 * Some tasks don't need to happen every loop, so
+	 * they happen only every multiple of these variables.
+	 * I think this could probably be accomplished with a
+	 * single variable instead of two.
+	 * Also, I don't know why it takes a whole int. -- Marshal
+	 */
+	int paceCounter = 0; 		// for 20hz tasks
+	int pace_counter_60 = 0;	// for 60hz tasks
 
+	/* Why are there so many sets of PID values?
+	 * What are the "Den" ones used for?
+	 */
 	int pidValues13[3] = {15,0,60};
-	int pidValuesDen13[3] = {16,1,1};
+	int pidValuesDen13[3] = {16,1,1}; // only used in motor speed
 
 	int pidValues24[3] = {15,0,60};
 	int pidValuesDen24[3] = {16,1,1};
 
+	/* Apparently it is a non-symmetrical system, so there are different
+	 * PID values for up vs down.  Strangly, these have identical values.
+	 * I would presume this means they haven't been tuned yet.
+	 */
 	char pidRotUp[3] = {11,0,20};
 	char pidRotDenUp[3] = {42,11,1};
 
@@ -62,12 +159,17 @@ int main(void){
 
 	char pidRot[] = {18,0,40};
 
-	/*counting var, for for loops*/
+	/* counting var, for for loops
+	 * If we used the c99 standard, we wouldn't need these,
+	 * but it might end up taking more clock cycles.
+	 */
 	int i;
 	int j;
 
-	/*Start memory location for Accel and Gyro reads, should be moved
-	  to gyro and accel read functions*/
+	/* Start memory location for Accel and Gyro reads, should be moved
+	 * to gyro and accel read functions.
+	 * These passed as pointers - the valuse here are just initial values.
+	 */
 	uint8_t accelstartbyte = 0x30;
 	uint8_t gyrostartbyte = 0x1A;
 
@@ -76,6 +178,10 @@ int main(void){
 	  [1] - Y axis tilt
 	  [2] - Throttle
 	  [3] - Rotation about Z axis
+
+	  The trim should probably be taken care of on the base-station side,
+	  not on the UAV side.  I don't know why there appear to be duplicate
+	  variables here.  What is the difference between joyaxis[] and joyin[]?
 	 */
 	int joyaxis[] = {0,0,0,0,0};
 	char joyin[] = {0,0,0,0,0};
@@ -98,7 +204,9 @@ int main(void){
 	char irdata[2] = {0,0};
 	char ir_horizontal_1[2] = {0,0};
 
-	//offset buffers
+	/* offset buffers
+	 * What is that?
+	 */
 	int gyrooffsetcache[3];
 	int acceloffsetcache[3];
 	int magoffsetcache = 0;
@@ -108,98 +216,33 @@ int main(void){
 	int accelnorm[3] = {11,-44,468};
 	char gyronorm[3] = {16,42,0};
 
-	int servo_angle = 0;
-	int servo_angle_right = 0;
-	int servo_angle_left = 0;
-	int forward_servo_angle = 0;
-
-	/*Buffer for sending data through the xbee*/
-	char xbeebuffer[100];
-
 	/*Byte for status update sent in data packet*/
 	char stat;
 
-	/*Set on board LED pins to output*/
-	PORTF.DIR = 0x03;
-
-	PORTA.DIR = 0;
 	int distance_data[5] = {0,0,0,0,0};
 	int distance_data_buffer[5] = {0,0,0,0,0};
 	adcInit(&ADCA);
 
-	/*Initialize PORTD to output on pins 0-3 from Timer counter pwm at
-	  50Hz*/
-	PORTD.DIR = 0x0F;
-	TCD0.CTRLA = TC_CLKSEL_DIV8_gc;
-	TCD0.CTRLB = TC_WGMODE_SS_gc | TC0_CCCEN_bm |  TC0_CCAEN_bm |TC0_CCBEN_bm | TC0_CCDEN_bm;
-	TCD0.PER = 8000;
+	/* Init the angle values for the servos to which are affixed the ir sensors.
+	 */
+	int servo_angle_left = LEFT_SERVO_DEFAULT;
+	int servo_angle_right = RIGHT_SERVO_DEFAULT; // this value is never changed, apparently
+	int forward_servo_angle = FORWARD_SERVO_DEFAULT; // this value is never changed, apparently
 
-
-	/*Initialize PORTC to output on pins 4-5 from Timer counter pwm at
-	  50Hz for horizontal sensors*/
-	PORTC.DIR = 0x30;
-	TCC1.CTRLA = TC_CLKSEL_DIV64_gc;
-	TCC1.CTRLB = TC_WGMODE_SS_gc | TC0_CCAEN_bm |TC0_CCBEN_bm;
-	TCC1.PER = 10000;
-	servo_angle_left = LEFT_SERVO_DEFAULT;
-	servo_angle_right = RIGHT_SERVO_DEFAULT;
 	TCC1.CCA = servo_angle_right;
 	TCC1.CCB = servo_angle_left;
-
-	/*Initialize PORTF to output on pin 0 from Timer counter pwm at
-	  50Hz for forward sensors including camera*/
-	PORTF.DIR = 0x03;
-	TCF0.CTRLA = TC_CLKSEL_DIV64_gc;
-	TCF0.CTRLB = TC_WGMODE_SS_gc | TC0_CCAEN_bm;
-	TCF0.PER = 10000;
-
-	forward_servo_angle = FORWARD_SERVO_DEFAULT;
 	TCF0.CCA = forward_servo_angle;
 
 
 
 
-	/*Set pwm duty cycle to stop motors, stop them from beeping 
-	  annoyingly*/
-	TCD0.CCA = 4000;
-	TCD0.CCB = 4000;
-	TCD0.CCC = 4000;
-	TCD0.CCD = 4000;
 
-	/*Initialize Timer counter C0 for pacing,RATE Hz*/
-	TCC0.CTRLA = TC_CLKSEL_DIV8_gc;
-	TCC0.CTRLB = TC_WGMODE_SS_gc;
-	TCC0.PER = 4000000 / RATE;
-
-	/*Set PORTC to power IMU, PIN 3 3.3V, pin 2 ground*/
-	//PORTC.DIR = 0b00001000;
-	//PORTC.OUT = 0b00001000;
-
-
-	/*Enable Watch Dog Timer to save us from catastrophe*/
-	CCPWrite( &WDT.CTRL, 0b00010111);
-
-	/*Enable global interrupts of all priority levels, should be made
-	  more relevant*/
-	PMIC.CTRL |= PMIC_LOLVLEX_bm | PMIC_MEDLVLEX_bm | PMIC_HILVLEX_bm |
-		PMIC_LOLVLEN_bm | PMIC_MEDLVLEN_bm | PMIC_HILVLEN_bm;
-	sei();
-
-	/*Initialize imu to use Two wire interface on portC*/
-	PORTE.PIN0CTRL |= 0b00011000;
-	PORTE.PIN1CTRL |= 0b00011000;
-	twiInitiate(&imu, &TWIE);
-	itg3200Init(&imu, RATE);
-	adxl345Init(&imu);
-	//lsm303dlhInit(&imu);
+	init();
 
 
 
-	/*Set Xbee Uart transmit pin 3 to output*/
-	PORTE.DIR = 0x88;
-	/*Initialize USARTE0 as the module used by the Xbee*/
-	uartInitiate(&xbee, &USARTE0, 115200);
-	uartInitiate(&mega, &USARTE1, 9600);
+	/*Buffer for sending data through the xbee*/
+	char xbeebuffer[100];
 
 	/*Send string to indicate startup, python doesn't like return carriage
 	  (/r) character*/
@@ -583,21 +626,30 @@ int main(void){
 					}
 
 
-					//Accelerometer Stuff
+					/**************************************
+					 * Accelerometer Stuff
+					 *************************************/
 					getaccel(accelcache, &imu, &accelstartbyte);
 					for(i = 0; i < 3; i ++){
 						accelcache[i] -= accelnorm[i];
 					}
 
 
+					// Why isn't this done inside a for() loop?
 					accelint[0] = ((ACCELINT * accelint[0]) + ((24 - ACCELINT) * accelcache[0]))/24;
 
 
 					accelint[1] = ((ACCELINT * accelint[1]) + ((24 - ACCELINT) * accelcache[1]))/24;
 
 
+					/* Limit the range of feedback to avoid overcorrection.
+					 * Is this to avoid occasional spikes, and deal with a
+					 * low sample-rate?
+					 * Perhaps it would be better to accept your feedback, and just
+					 * limit the response?
+					 */
 					if(accelint[1] > (pry[0] + 15)){
-						accelint[1] = pry[0] + 15;
+						accelint[1] = pry[0] + 15;	// why is 15 a magic number?
 					}
 					else if(accelint[1] < (pry[0] - 15)){
 						accelint[1] = pry[0] - 15;
@@ -636,10 +688,19 @@ int main(void){
 				}
 
 
-				motorSpeed(pry, integration ,gyroint, joyaxis, motorSpeeds, pidValues13, pidValues24, pidValuesDen13, pidValuesDen24);
-				yawCorrect(motorSpeeds, gyroint, integration, &roterr,pidRotUp,pidRotDenUp,pidRotDown,pidRotDenDown);
+				/* Update the motor speeds.
+				 * Is this our PID loop?
+				 */
+				motorSpeed(pry, integration ,gyroint, joyaxis, 
+						motorSpeeds, pidValues13, pidValues24, 
+						pidValuesDen13, pidValuesDen24);
+
+				yawCorrect(motorSpeeds, gyroint, integration, 
+						&roterr,pidRotUp,pidRotDenUp,pidRotDown,
+						pidRotDenDown);
 
 
+				/* If we lose too many packets, then stop. */
 				if(lostsignalcnt > 12){
 					for(i = 0; i < 4; i ++){
 						motorSpeeds[i] = 4000;
@@ -648,6 +709,7 @@ int main(void){
 				}
 
 
+				/* Wait until timer0 is between 5000 and 10000 */
 				while(!((TCD0.CNT > 10000) || (TCD0.CNT < 5000)));
 
 				TCD0.CCA = 2 * motorSpeeds[0];// - motordif13;
@@ -655,7 +717,7 @@ int main(void){
 				TCD0.CCB = 2 * motorSpeeds[1];// + motordif24;
 				TCD0.CCD = 2 * motorSpeeds[3];// - motordif24;
 
-				PORTC.OUT ^= 8;
+				PORTC.OUTTGL ^= 0x08;	// toggle PWM6
 				break;
 
 		}
@@ -665,7 +727,9 @@ int main(void){
 
 
 
-	/*Xbee read interrupt*/
+/* Xbee read interrupt
+ * First three bytes of packet are " 0a" ?
+ */
 ISR(USARTE0_RXC_vect){
 	USART_RXComplete(&xbee);
 	input[xbeecounter] = USART_RXBuffer_GetByte(&xbee);

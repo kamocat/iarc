@@ -5,12 +5,22 @@ Source code for flight control support functions
 */
 
 #include <stdlib.h>
-#include "../../drivers/avr_compiler.h"
-#include "../../drivers/usart_driver.h"
-#include "../../drivers/twi_master_driver.h"
+#include <avr_compiler.h>
+#include <usart_driver.h>
+#include <twi_master_driver.h>
 #include "support.h"
 #include <stdio.h>
 
+/* Set the system clock to 32mhz */
+void set_clock( void ) {
+	OSC.CTRL = 0b00000010;//Enable oscilator
+	while(!(OSC.STATUS & 0b00000010));//wait for it to be ready
+	CCPWrite(&CLK.CTRL, 0b00000001);//Enable oscilator
+}
+
+/* This function is dumb.
+ * Use a lookup table. -- Marshal
+ */
 //136 is 10 degrees, 4900 is full circle
 int arctan2(int opp, int adj){
 

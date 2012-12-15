@@ -49,6 +49,7 @@
 
 #define LITTLE_ENDIAN   1
 
+void set_clock( void );
 
 int arctan2(int opp, int adj);
 
