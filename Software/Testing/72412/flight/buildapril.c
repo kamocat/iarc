@@ -4,17 +4,17 @@
 #include "../../drivers/twi_master_driver.h"
 #include "support.h"
 #include <stdio.h>
-#include "itg3200.h"
-#include "adxl345.h"
+#include "itg3200.h" // gyro - i2c
+#include "adxl345.h" // acceleromter - i2c
 #include "math.h" 
-#include "../../drl/adc.h"
+#include "../drl/adc.h" // for IR sensors
 //#include "lsm303dlh.h" 
 /*Xbee Wireless Communication Module, initialized later*/
 USART_data_t xbee;
 USART_data_t mega;
 
 /*Two wire interface module for Inertial Measurement Unit*/
-TWI_Master_t imu;
+TWI_Master_t imu; // that means acceleromter
 
 /*States for flight control state machine*/
 enum states{running, stopped, offset} state = stopped;
@@ -43,7 +43,7 @@ int main(void){
 
 	char lostsignalcnt = 0;
 
-	int pry[] = {0,0,0};
+	int pry[] = {0,0,0}; // pitch, roll, yaw
 
 	int paceCounter = 0;
 	int pace_counter_60 = 0;
