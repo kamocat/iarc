@@ -5,6 +5,9 @@
 
 */
 
+#ifndef SUPPORT_HEADER
+#define SUPPORT_HEADER
+
 #define FORWARD_SERVO_DEFAULT 900
 #define RIGHT_SERVO_DEFAULT 600
 #define LEFT_SERVO_DEFAULT 1000
@@ -51,8 +54,6 @@
 
 void set_clock( void );
 
-int arctan2(int opp, int adj);
-
 void sprintBinary(char * buffer, int * value);
 
 void sendchar( USART_data_t * uart, char buffer);
@@ -79,3 +80,4 @@ void motorSpeed(int * pry,
 
 void yawCorrect(int * motorSpeeds, int * gyroint,int * integration, int * roterr, char * pidRotUp, char * pidRotDenUp, char * pidRotDown, char * pidRotDenDown);
 
+#endif
