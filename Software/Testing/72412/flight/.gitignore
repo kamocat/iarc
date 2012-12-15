@@ -1,0 +1,13 @@
+# vim swap files
+*.swp
+
+# Other editing files?
+*~
+
+# Compiled files
+*.o
+*.hex
+*.eep
+*.map
+dep/
+*.elf
